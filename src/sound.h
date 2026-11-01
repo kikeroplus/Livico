@@ -14,6 +14,7 @@ enum Sound
   SND_START, // タイマーのスタート・再開
   SND_PAUSE, // タイマーの一時停止・リセット
   SND_TIMER, // タイマー終了 (くり返し鳴らす 1 回ぶん)
+  SND_WAKE,  // 目覚まし (くり返し鳴らす 1 回ぶん)
   SND_N
 };
 
@@ -29,6 +30,8 @@ enum
 
 void soundBegin();
 void soundSetVolume(int level);
+// 音量の設定にかかわらず level で鳴らす (目覚まし用。OFF でも鳴る)。-1 で元に戻す
+void soundFixVolume(int level);
 void soundPlay(Sound s);
 // かなの文をしゃべる。鳴っている音が終わってからしゃべる
 void soundSay(const char *kana);

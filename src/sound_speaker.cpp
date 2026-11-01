@@ -51,6 +51,9 @@ const ToneDef D_VOL[] = {{0, C6, T_CHIME, 0.35f, 150, 500}, {90, G5, T_CHIME, 0.
 const ToneDef D_START[] = {{0, G5, T_CHIME, 0.35f, 120, 400}, {70, C6, T_CHIME, 0.35f, 150, 500}};
 const ToneDef D_PAUSE[] = {{0, C6, T_CHIME, 0.35f, 120, 400}, {70, G5, T_CHIME, 0.35f, 150, 500}};
 // タイマー終了: WorkingTimer と同じ「ピピピッ」(main.cpp が 1 秒ごとにくり返す)
+// 目覚まし: ドミソド と短く上げる (main.cpp が 2 秒ごとにくり返す)
+const ToneDef D_WAKE[] = {{0, C6, T_BEEP, 0.30f, 0, 90}, {120, E6, T_BEEP, 0.30f, 0, 90},
+                          {240, G6, T_BEEP, 0.30f, 0, 90}, {360, C7, T_BEEP, 0.30f, 0, 150}};
 const ToneDef D_TIMER[] = {{0, C7, T_BEEP, 0.30f, 0, 80}, {150, C7, T_BEEP, 0.30f, 0, 80}, {300, C7, T_BEEP, 0.30f, 0, 80}};
 
 struct SoundDef
@@ -70,12 +73,15 @@ const SoundDef SOUNDS[] = {
     DEF(D_START, 300),  // SND_START
     DEF(D_PAUSE, 300),  // SND_PAUSE
     DEF(D_TIMER, 450),  // SND_TIMER
+    DEF(D_WAKE, 600),   // SND_WAKE
 };
 static_assert(sizeof(SOUNDS) / sizeof(SOUNDS[0]) == SND_N, "sound.h の Sound と数が合わない");
 
 // 音量ごとの倍率
 const float VOL_GAIN[VOL_N] = {1.0f, 0.4f, 0.15f, 0.0f};
 volatile int volLevel = VOL_HIGH;
+volatile int fixedLevel = -1; // 0 以上なら volLevel の代わりにこの音量で鳴らす (目覚まし)
+int curLevel() { return fixedLevel >= 0 ? fixedLevel : volLevel; }
 
 // ---- 鳴っている音 ----
 const int TONE_MAX = 12;
@@ -194,7 +200,7 @@ void audioTask(void *)
     synth->render(voice, N);
     pos += N;
     xSemaphoreGive(lock);
-    float g = VOL_GAIN[volLevel];
+    float g = VOL_GAIN[curLevel()];
     for (int i = 0; i < N; i++)
     {
       float v = (tone[i] * TONE_VOLUME + voice[i] * VOICE_VOLUME) * g;
@@ -249,9 +255,14 @@ void soundSetVolume(int level)
     soundStop();
 }
 
+void soundFixVolume(int level)
+{
+  fixedLevel = level;
+}
+
 void soundPlay(Sound s)
 {
-  if (volLevel == VOL_OFF || !lock)
+  if (curLevel() == VOL_OFF || !lock)
     return;
   const SoundDef &d = SOUNDS[s];
   xSemaphoreTake(lock, portMAX_DELAY);
@@ -266,7 +277,7 @@ void soundPlay(Sound s)
 
 void soundSay(const char *kana)
 {
-  if (volLevel == VOL_OFF || !lock)
+  if (curLevel() == VOL_OFF || !lock)
     return;
   strlcpy(sayText, kana, sizeof(sayText));
   sayPending = true; // 鳴っている音が落ち着いたら soundUpdate() でしゃべり始める

@@ -1,4 +1,5 @@
 // Livico: WorkingTimer のタイマーと、PC1〜PC3 の負荷・温度 (InfoPanel の 02 SYSTEMS) を 1 つの画面に出す
+// 2 画面目はタイマーの代わりに目覚まし (SW1 長押しで切り替え。下の段の PC はどちらも同じ)
 // MQTT・アラート・描画の部品は InfoPanel から、タイマーの動きは WorkingTimer から持ってきている
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
@@ -266,6 +267,28 @@ void recordDone()
 }
 
 uint16_t todayCount() { return todayIndex() == (int32_t)doneDay ? doneCount : 0; }
+
+// ---- 画面 (SW1 長押しで切り替え) ----
+enum Page
+{
+  PG_TIMER, // 1 画面目: カウントダウンタイマー
+  PG_ALARM, // 2 画面目: 目覚まし
+  PG_N
+};
+int page = PG_TIMER;
+
+// ---- 目覚まし (2 画面目) ----
+// 起きる時刻は 6:00 から 30 分おきに 12 個 (11:30 まで) から選ぶ。毎日その時刻に鳴る
+const int WAKE_FIRST_MIN = 6 * 60, WAKE_STEP_MIN = 30, WAKE_N = 12;
+const uint32_t WAKE_RING_MS = 5UL * 60 * 1000; // 止めなければ 5 分で鳴りやむ
+const int WAKE_VOLUME = VOL_MID;                // 目覚ましの音量。SW3 の音量 (OFF も) にかかわらずこの大きさ
+int wakeIdx = 0;
+bool wakeOn = false;
+bool wakeRinging = false;
+uint32_t wakeAt = 0, wakeBeepAt = 0, wakeSayAt = 0;
+int32_t wakeFiredKey = -1; // 鳴らした日と分 (同じ分に 2 回鳴らさない)
+
+int wakeMin(int i) { return WAKE_FIRST_MIN + i * WAKE_STEP_MIN; }
 
 // ---- アラート (画面中央に重ねて出す。新しいものが来たら置き換える) ----
 enum AlertKind
@@ -676,19 +699,13 @@ int segText(int x, int y, int w, int h, int t, int gap, const char *s, uint32_t 
 }
 
 // ---- 画面 ----
-// 上の段 (y 0〜93): 左に現在時刻 (大)、右にタイマー。一番上の行は日付・音量・接続とプリセット
+// 上の段 (y 0〜93): 左に現在時刻 (大)、右にタイマーか目覚まし。一番上の行の左は日付・音量・接続
 const int TIMER_H = 94;
 
-void drawTimer()
+// 一番上の行の左: 日付・曜日、音量、接続ランプ (緑 = WiFi と MQTT、黄 = WiFi だけ、赤 = WiFi なし)
+void drawStatusLine(bool synced, const struct tm &t)
 {
-  char buf[24];
-  uint32_t rem = timerRemaining();
-  float frac = totalMs ? (float)rem / totalMs : 1.0f;
-  uint32_t accent = state == DONE ? C_RED : phaseRGB(frac);
-
-  // 一番上の行の左: 日付・曜日、音量、接続ランプ (緑 = WiFi と MQTT、黄 = WiFi だけ、赤 = WiFi なし)
-  struct tm t;
-  bool synced = timeSynced(t);
+  char buf[16];
   if (synced)
   {
     static const char *WDAY[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
@@ -702,6 +719,37 @@ void drawTimer()
   bool wifiOk = WiFi.status() == WL_CONNECTED;
   bool mqttOk = mqttEnabled() && mqtt.state() == MQTT_CONNECTED;
   cv->fillRect(108, 8, 5, 5, c565(wifiOk && (mqttOk || !mqttEnabled()) ? C_GREEN : wifiOk ? C_YELLOW : C_RED));
+}
+
+// 左: 現在時刻 (大きな 7 セグ) と秒
+void drawBigClock(bool synced, const struct tm &t)
+{
+  char buf[8];
+  if (synced)
+    snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+  else
+    strcpy(buf, "--:--");
+  bool colon = !synced || blinkOn();
+  int w = segText(8, 22, 34, 56, 5, 6, buf, C_TEXT, colon ? C_CYAN : C_SEGOFF);
+  if (synced)
+  {
+    snprintf(buf, sizeof(buf), "%02d", t.tm_sec);
+    text(8 + w + 6, 64, 2, C_CYAN, buf);
+  }
+}
+
+// 1 画面目: カウントダウンタイマー
+void drawTimer()
+{
+  char buf[24];
+  uint32_t rem = timerRemaining();
+  float frac = totalMs ? (float)rem / totalMs : 1.0f;
+  uint32_t accent = state == DONE ? C_RED : phaseRGB(frac);
+
+  struct tm t;
+  bool synced = timeSynced(t);
+  drawStatusLine(synced, t);
+  drawBigClock(synced, t);
 
   // 一番上の行の右: プリセット (分)
   for (int i = 0; i < PRESET_N; i++)
@@ -718,19 +766,6 @@ void drawTimer()
       cv->drawRect(x, y, w, h, c565(C_LINE));
       textC(x + w / 2 + 1, y + 3, 1, C_DIM, buf);
     }
-  }
-
-  // 左: 現在時刻 (大きな 7 セグ) と秒
-  if (synced)
-    snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
-  else
-    strcpy(buf, "--:--");
-  bool colon = !synced || blinkOn();
-  int w = segText(8, 22, 34, 56, 5, 6, buf, C_TEXT, colon ? C_CYAN : C_SEGOFF);
-  if (synced)
-  {
-    snprintf(buf, sizeof(buf), "%02d", t.tm_sec);
-    text(8 + w + 6, 64, 2, C_CYAN, buf);
   }
 
   // 右: 残り時間。120 分のときは 5 桁になるので数字を細くする
@@ -770,6 +805,58 @@ void drawTimer()
   if (state == DONE && blinkOn())
     for (int k = 0; k < 3; k++)
       cv->drawRect(k, k, SCREEN_W - 2 * k, TIMER_H - 2 * k, c565(C_RED));
+}
+
+// 2 画面目: 目覚まし。右に起きる時刻の一覧 (3 列 x 4 行)
+void drawAlarm()
+{
+  char buf[32];
+  struct tm t;
+  bool synced = timeSynced(t);
+  drawStatusLine(synced, t);
+  drawBigClock(synced, t);
+
+  uint32_t accent = wakeOn ? C_YELLOW : C_DIM;
+  textR(314, 7, 1, accent, wakeOn ? "ALARM ON" : "ALARM OFF");
+
+  for (int i = 0; i < WAKE_N; i++)
+  {
+    int x = 206 + (i % 3) * 36, y = 20 + (i / 3) * 14, w = 33, h = 12;
+    int m = wakeMin(i);
+    snprintf(buf, sizeof(buf), "%d:%02d", m / 60, m % 60);
+    if (i == wakeIdx)
+    {
+      cv->fillRect(x, y, w, h, c565(accent));
+      textC(x + w / 2 + 1, y + 2, 1, C_BG, buf);
+    }
+    else
+    {
+      cv->drawRect(x, y, w, h, c565(C_LINE));
+      textC(x + w / 2 + 1, y + 2, 1, C_DIM, buf);
+    }
+  }
+
+  // 下の行: 次に鳴る時刻とあと何時間か。右は動いているタイマー
+  cv->drawFastHLine(8, 79, 304, c565(C_LINE));
+  int m = wakeMin(wakeIdx);
+  if (!wakeOn)
+    snprintf(buf, sizeof(buf), "WAKE %02d:%02d  OFF", m / 60, m % 60);
+  else if (synced)
+  {
+    int left = (m - (t.tm_hour * 60 + t.tm_min) + 1440 - 1) % 1440 + 1; // 次に鳴るまでの分 (1〜1440)
+    snprintf(buf, sizeof(buf), "WAKE %02d:%02d  IN %dH%02dM", m / 60, m % 60, left / 60, left % 60);
+  }
+  else
+    snprintf(buf, sizeof(buf), "WAKE %02d:%02d", m / 60, m % 60);
+  text(8, 83, 1, wakeOn ? C_TEXT : C_DIM, buf);
+  if (state != READY)
+  {
+    char rem[10];
+    formatRemain(rem, timerRemaining());
+    snprintf(buf, sizeof(buf), "TIMER %s", state == DONE ? "DONE" : rem);
+    float frac = totalMs ? (float)timerRemaining() / totalMs : 1.0f;
+    textR(314, 83, 1, state == DONE ? C_RED : state == PAUSED ? C_DIM : phaseRGB(frac), buf);
+  }
 }
 
 // ComfyUI の状態を 1 行に (枠の左の欄、15 文字まで)
@@ -850,7 +937,7 @@ void drawPcRow(int i)
 }
 
 // アラートを画面中央に重ねる。枠が点滅する
-void drawAlert()
+void drawAlert(const Alert &alert)
 {
   int x = 18, y = 62, w = 284, h = 116;
   bool blink = (millis() - alert.shownAt) % 800 < 400;
@@ -903,19 +990,33 @@ void renderFrame()
     return;
   }
   cv->fillScreen(c565(C_BG));
-  drawTimer();
+  if (page == PG_ALARM)
+    drawAlarm();
+  else
+    drawTimer();
   for (int i = 0; i < PC_N; i++)
     drawPcRow(i);
-  if (millis() < toastUntil && !alert.active)
+  if (millis() < toastUntil && !alert.active && !wakeRinging)
     drawToast();
-  if (alert.active)
-    drawAlert();
+  if (wakeRinging) // 目覚ましはほかのアラートより上に出す
+  {
+    Alert box = {};
+    box.rgb = C_YELLOW;
+    int m = wakeMin(wakeIdx);
+    snprintf(box.title, sizeof(box.title), "ALARM %d:%02d", m / 60, m % 60);
+    strcpy(box.detail, "GOOD MORNING");
+    nowHHMM(box.at);
+    box.shownAt = wakeAt;
+    drawAlert(box);
+  }
+  else if (alert.active)
+    drawAlert(alert);
   cv->flush();
 }
 
 // ---- タイマーの終了アラーム ----
 // 終わったら「ピピピッ」と「じかんに なりました」、そのあと 30 秒まで 1 秒ごとに「ピピピッ」。
-// アラート・呼び出しの表示中は待たせ、閉じたあとに最初から鳴らす (WorkingTimer と同じ)
+// アラート・呼び出し・目覚ましの間は待たせ、閉じたあとに最初から鳴らす (WorkingTimer と同じ)
 const uint32_t ALARM_MS = 30000;
 bool alarmPending = false, alarmOn = false;
 uint32_t alarmAt = 0, alarmBeepAt = 0;
@@ -927,6 +1028,7 @@ void timerUpdate()
     state = DONE;
     alarmPending = true;
     recordDone();
+    page = PG_TIMER;
     Serial.printf("timer: done (%u min, today %u)\n", PRESETS[presetIdx], todayCount());
   }
   if (state != DONE)
@@ -935,7 +1037,7 @@ void timerUpdate()
     return;
   }
   uint32_t now = millis();
-  if (alert.active)
+  if (alert.active || wakeRinging)
   {
     if (alarmOn && now - alarmAt < ALARM_MS)
     {
@@ -960,11 +1062,68 @@ void timerUpdate()
   }
 }
 
+// ---- 目覚ましを鳴らす ----
+// 鳴り始めに「おはよう ございます」、そのあと 2 秒ごとに音、30 秒ごとに声。どれかのスイッチで止める
+void startWake()
+{
+  wakeRinging = true;
+  wakeAt = wakeBeepAt = wakeSayAt = millis();
+  page = PG_ALARM;
+  soundStop();                 // ほかの音は止めて
+  soundFixVolume(WAKE_VOLUME); // 寝るときに音を消していても鳴るように、音量の設定とは別に決めた大きさで
+  soundPlay(SND_WAKE);
+  soundSay("おはよう ございます。 じかんです。");
+  Serial.printf("wake: ringing %d:%02d\n", wakeMin(wakeIdx) / 60, wakeMin(wakeIdx) % 60);
+}
+
+void stopWake()
+{
+  wakeRinging = false;
+  soundStop();
+  soundFixVolume(-1);
+  Serial.println("wake: stopped");
+}
+
+void wakeUpdate()
+{
+  struct tm t;
+  if (wakeOn && !wakeRinging && timeSynced(t))
+  {
+    int32_t key = t.tm_yday * 1440 + t.tm_hour * 60 + t.tm_min;
+    if (t.tm_hour * 60 + t.tm_min == wakeMin(wakeIdx) && key != wakeFiredKey)
+    {
+      wakeFiredKey = key;
+      startWake();
+    }
+  }
+  if (!wakeRinging)
+    return;
+  uint32_t now = millis();
+  if (now - wakeAt >= WAKE_RING_MS)
+  {
+    stopWake();
+    return;
+  }
+  if (now - wakeSayAt >= 30000)
+  {
+    wakeSayAt = now;
+    soundSay("おはよう ございます。 じかんです。");
+  }
+  else if (now - wakeSayAt >= 4000 && now - wakeBeepAt >= 2000) // しゃべっている間は鳴らさない
+  {
+    wakeBeepAt = now;
+    soundPlay(SND_WAKE);
+  }
+}
+
 // ---- スイッチの操作 ----
 void savePrefs()
 {
   prefs.putUChar("preset", presetIdx);
   prefs.putUChar("vol", volLevel);
+  prefs.putUChar("page", page);
+  prefs.putUChar("wake", wakeIdx);
+  prefs.putBool("wakeOn", wakeOn);
 }
 
 void handleButtons()
@@ -972,54 +1131,87 @@ void handleButtons()
   BtnEv e1 = buttonUpdate(sw1), e2 = buttonUpdate(sw2), e3 = buttonUpdate(sw3);
   if (e1 == EV_NONE && e2 == EV_NONE && e3 == EV_NONE)
     return;
-  // アラート中はどれかを押すと閉じるだけ (この押下はタイマーの操作に使わない)
-  if (alert.active)
+  // 目覚まし・アラート中はどれかを押すと止める・閉じるだけ (この押下はほかの操作に使わない)
+  if (wakeRinging || alert.active)
   {
     if (e1 == EV_SHORT || e2 == EV_SHORT || e3 == EV_SHORT)
     {
-      alert.active = false;
-      soundStop();
+      if (wakeRinging)
+        stopWake();
+      else
+      {
+        alert.active = false;
+        soundStop();
+      }
       soundPlay(SND_CLICK);
     }
     return;
   }
 
-  // SW1: 時間を選ぶ (動いている間は変えない)
-  if (e1 == EV_SHORT && state != RUNNING)
+  // SW1 長押し: 画面の切り替え (タイマー ⇔ 目覚まし)
+  if (e1 == EV_LONG)
   {
-    presetIdx = (presetIdx + 1) % PRESET_N;
-    resetTimer();
+    page = (page + 1) % PG_N;
     savePrefs();
     soundPlay(SND_CLICK);
   }
 
-  // SW2: スタート・一時停止・再開。終わったあとは READY に戻す。長押しでリセット
-  if (e2 == EV_SHORT)
+  if (page == PG_TIMER)
   {
-    switch (state)
+    // SW1: 時間を選ぶ (動いている間は変えない)
+    if (e1 == EV_SHORT && state != RUNNING)
     {
-    case READY:
-    case PAUSED:
-      endAt = millis() + remainMs;
-      state = RUNNING;
-      soundPlay(SND_START);
-      break;
-    case RUNNING:
-      pauseTimer();
-      soundPlay(SND_PAUSE);
-      break;
-    case DONE:
+      presetIdx = (presetIdx + 1) % PRESET_N;
       resetTimer();
-      soundStop(); // 鳴っているアラームと声を止める
+      savePrefs();
+      soundPlay(SND_CLICK);
+    }
+
+    // SW2: スタート・一時停止・再開。終わったあとは READY に戻す。長押しでリセット
+    if (e2 == EV_SHORT)
+    {
+      switch (state)
+      {
+      case READY:
+      case PAUSED:
+        endAt = millis() + remainMs;
+        state = RUNNING;
+        soundPlay(SND_START);
+        break;
+      case RUNNING:
+        pauseTimer();
+        soundPlay(SND_PAUSE);
+        break;
+      case DONE:
+        resetTimer();
+        soundStop(); // 鳴っているアラームと声を止める
+        soundPlay(SND_PAUSE);
+        break;
+      }
+    }
+    else if (e2 == EV_LONG)
+    {
+      resetTimer();
+      soundStop();
       soundPlay(SND_PAUSE);
-      break;
     }
   }
-  else if (e2 == EV_LONG)
+  else
   {
-    resetTimer();
-    soundStop();
-    soundPlay(SND_PAUSE);
+    // SW1: 起きる時刻を選ぶ (選んだら ON にする)。SW2: ON / OFF
+    if (e1 == EV_SHORT)
+    {
+      wakeIdx = (wakeIdx + 1) % WAKE_N;
+      wakeOn = true;
+      savePrefs();
+      soundPlay(SND_CLICK);
+    }
+    if (e2 == EV_SHORT)
+    {
+      wakeOn = !wakeOn;
+      savePrefs();
+      soundPlay(wakeOn ? SND_START : SND_PAUSE);
+    }
   }
 
   // SW3: 音量 (HIGH → MID → LOW → OFF の順に回る)
@@ -1042,6 +1234,9 @@ void setup()
   prefs.begin("livico", false);
   presetIdx = prefs.getUChar("preset", 3) % PRESET_N;
   volLevel = prefs.getUChar("vol", VOL_LOW) % VOL_N;
+  page = prefs.getUChar("page", PG_TIMER) % PG_N;
+  wakeIdx = prefs.getUChar("wake", 0) % WAKE_N;
+  wakeOn = prefs.getBool("wakeOn", false);
   doneDay = prefs.getUInt("tDay", 0);
   doneCount = prefs.getUShort("tCnt", 0);
   doneMins = prefs.getUShort("tMin", 0);
@@ -1089,7 +1284,7 @@ void setup()
 
   configTzTime("JST-9", "ntp.nict.jp", "time.google.com", "pool.ntp.org"); // オフラインでも、後でつながれば合う
 
-  // 設定を消すために押した SW1 を、離したときの操作 (時間を選ぶ) として拾わない
+  // 設定を消すために押した SW1 を、離したときの操作 (時間を選ぶ・画面の切り替え) として拾わない
   if (digitalRead(SW1_PIN) == LOW)
     sw1.down = sw1.raw = sw1.longFired = true;
 
@@ -1103,6 +1298,7 @@ void loop()
   mqttUpdate();
   handleButtons();
   timerUpdate();
+  wakeUpdate();
   callUpdate();
   soundUpdate();
 
