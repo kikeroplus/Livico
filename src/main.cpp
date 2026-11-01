@@ -1,5 +1,5 @@
 // Livico: WorkingTimer のタイマーと、PC1〜PC3 の負荷・温度 (InfoPanel の 02 SYSTEMS) を 1 つの画面に出す
-// 2 画面目はタイマーの代わりに目覚まし (SW1 長押しで切り替え。下の段の PC はどちらも同じ)
+// 2 画面目はタイマーの代わりに目覚まし。3・4 画面目はタイマー・目覚ましを選びやすくした設定の画面 (SW1 長押しで切り替え)
 // MQTT・アラート・描画の部品は InfoPanel から、タイマーの動きは WorkingTimer から持ってきている
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
@@ -271,13 +271,15 @@ uint16_t todayCount() { return todayIndex() == (int32_t)doneDay ? doneCount : 0;
 // ---- 画面 (SW1 長押しで切り替え) ----
 enum Page
 {
-  PG_TIMER, // 1 画面目: カウントダウンタイマー
-  PG_ALARM, // 2 画面目: 目覚まし
+  PG_TIMER,     // 1 画面目: カウントダウンタイマーと PC
+  PG_ALARM,     // 2 画面目: 目覚ましと PC
+  PG_TIMER_SET, // 3 画面目: タイマーの設定 (現在時刻を大きく、プリセットを大きなボタンで)
+  PG_ALARM_SET, // 4 画面目: 目覚ましの設定 (現在時刻を大きく、起きる時刻を大きなボタンで)
   PG_N
 };
 int page = PG_TIMER;
 
-// ---- 目覚まし (2 画面目) ----
+// ---- 目覚まし (2 画面目と 4 画面目) ----
 // 起きる時刻は 6:00 から 30 分おきに 12 個 (11:30 まで) から選ぶ。毎日その時刻に鳴る
 const int WAKE_FIRST_MIN = 6 * 60, WAKE_STEP_MIN = 30, WAKE_N = 12;
 const uint32_t WAKE_RING_MS = 5UL * 60 * 1000; // 止めなければ 5 分で鳴りやむ
@@ -698,6 +700,15 @@ int segText(int x, int y, int w, int h, int t, int gap, const char *s, uint32_t 
   return x - x0 - gap;
 }
 
+// segText で描いたときの幅
+int segTextW(int w, int t, int gap, const char *s)
+{
+  int x = 0;
+  for (const char *p = s; *p; p++)
+    x += (*p == ':' ? t + 1 : w) + gap;
+  return x - gap;
+}
+
 // ---- 画面 ----
 // 上の段 (y 0〜93): 左に現在時刻 (大)、右にタイマーか目覚まし。一番上の行の左は日付・音量・接続
 const int TIMER_H = 94;
@@ -859,6 +870,142 @@ void drawAlarm()
   }
 }
 
+// 3・4 画面目: 現在時刻をいちばん大きく (上の真ん中) と秒
+void drawHugeClock(bool synced, const struct tm &t)
+{
+  char buf[8];
+  if (synced)
+    snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+  else
+    strcpy(buf, "--:--");
+  bool colon = !synced || blinkOn();
+  const int W = 50, H = 90, T = 8, GAP = 8;
+  int x = (SCREEN_W - segTextW(W, T, GAP, buf) - (synced ? 8 + 36 : 0)) / 2;
+  int w = segText(x, 24, W, H, T, GAP, buf, C_TEXT, colon ? C_CYAN : C_SEGOFF);
+  if (synced)
+  {
+    snprintf(buf, sizeof(buf), "%02d", t.tm_sec);
+    text(x + w + 8, 24 + H - 24, 3, C_CYAN, buf);
+  }
+}
+
+// 3 画面目: タイマーの設定。下にプリセットを 4 列 x 2 行の大きなボタンで
+void drawTimerSet()
+{
+  char buf[24];
+  uint32_t rem = timerRemaining();
+  float frac = totalMs ? (float)rem / totalMs : 1.0f;
+  uint32_t accent = state == DONE ? C_RED : phaseRGB(frac);
+
+  struct tm t;
+  bool synced = timeSynced(t);
+  drawStatusLine(synced, t);
+  int m = wakeMin(wakeIdx);
+  if (wakeOn)
+    snprintf(buf, sizeof(buf), "ALARM %d:%02d", m / 60, m % 60);
+  else
+    strcpy(buf, "ALARM OFF");
+  textR(314, 7, 1, wakeOn ? C_YELLOW : C_DIM, buf);
+  drawHugeClock(synced, t);
+
+  // 残り時間 (小さな 7 セグ)・状態・終わる時刻か選んだ長さ・今日終えた回数
+  cv->drawFastHLine(8, 123, 304, c565(C_LINE));
+  formatRemain(buf, rem);
+  uint32_t on = state == DONE ? (blinkOn() ? C_RED : C_SEGOFF) : state == PAUSED ? mix(accent, 0x787878, 0.5f) : accent;
+  int w = segText(8, 129, strlen(buf) > 5 ? 14 : 18, 28, 3, 3, buf, on, on);
+  static const char *STATE_NAMES[] = {"READY", "RUN", "PAUSE", "DONE"};
+  uint32_t sc = state == RUNNING ? accent : state == PAUSED ? (blinkOn() ? C_AMBER : C_DIM) : state == DONE ? (blinkOn() ? C_RED : C_SEGOFF) : C_TEXT;
+  if (state == RUNNING && blinkOn())
+    cv->fillCircle(8 + w + 12, 142, 3, c565(sc));
+  text(8 + w + 20, 135, 2, sc, STATE_NAMES[state]);
+  if (state == RUNNING && synced)
+  {
+    time_t e = time(nullptr) + (rem + 999) / 1000;
+    struct tm et;
+    localtime_r(&e, &et);
+    snprintf(buf, sizeof(buf), "END %02d:%02d", et.tm_hour, et.tm_min);
+    textR(314, 131, 1, accent, buf);
+  }
+  else
+  {
+    snprintf(buf, sizeof(buf), "%u MIN", PRESETS[presetIdx]);
+    textR(314, 131, 1, C_DIM, buf);
+  }
+  snprintf(buf, sizeof(buf), "TODAY %u", todayCount());
+  textR(314, 145, 1, todayCount() ? C_TEXT : C_DIM, buf);
+  segBar(8, 160, 304, 4, frac * 100, accent);
+
+  // プリセット (分)
+  for (int i = 0; i < PRESET_N; i++)
+  {
+    int x = 8 + (i % 4) * 77, y = 168 + (i / 4) * 36, bw = 73, bh = 32;
+    snprintf(buf, sizeof(buf), "%u", PRESETS[i]);
+    if (i == presetIdx)
+    {
+      cv->fillRect(x, y, bw, bh, c565(accent));
+      textC(x + bw / 2 + 1, y + 5, 3, C_BG, buf);
+    }
+    else
+    {
+      cv->drawRect(x, y, bw, bh, c565(C_LINE));
+      textC(x + bw / 2 + 1, y + 5, 3, C_DIM, buf);
+    }
+  }
+
+  // 終わったら画面の縁を赤く点滅
+  if (state == DONE && blinkOn())
+    for (int k = 0; k < 3; k++)
+      cv->drawRect(k, k, SCREEN_W - 2 * k, SCREEN_H - 2 * k, c565(C_RED));
+}
+
+// 4 画面目: 目覚ましの設定。下に起きる時刻を 4 列 x 3 行の大きなボタンで
+void drawAlarmSet()
+{
+  char buf[32];
+  struct tm t;
+  bool synced = timeSynced(t);
+  drawStatusLine(synced, t);
+  if (state != READY)
+  {
+    char rem[10];
+    formatRemain(rem, timerRemaining());
+    snprintf(buf, sizeof(buf), "TIMER %s", state == DONE ? "DONE" : rem);
+    float frac = totalMs ? (float)timerRemaining() / totalMs : 1.0f;
+    textR(314, 7, 1, state == DONE ? C_RED : state == PAUSED ? C_DIM : phaseRGB(frac), buf);
+  }
+  drawHugeClock(synced, t);
+
+  // ON / OFF と、次に鳴るまで
+  cv->drawFastHLine(8, 123, 304, c565(C_LINE));
+  uint32_t accent = wakeOn ? C_YELLOW : C_DIM;
+  text(8, 131, 2, accent, wakeOn ? "ALARM ON" : "ALARM OFF");
+  int m = wakeMin(wakeIdx);
+  if (wakeOn && synced)
+  {
+    int left = (m - (t.tm_hour * 60 + t.tm_min) + 1440 - 1) % 1440 + 1; // 次に鳴るまでの分 (1〜1440)
+    snprintf(buf, sizeof(buf), "IN %dH%02dM", left / 60, left % 60);
+    textR(314, 131, 2, C_TEXT, buf);
+  }
+
+  // 起きる時刻
+  for (int i = 0; i < WAKE_N; i++)
+  {
+    int x = 8 + (i % 4) * 77, y = 154 + (i / 4) * 28, bw = 73, bh = 25;
+    int wm = wakeMin(i);
+    snprintf(buf, sizeof(buf), "%d:%02d", wm / 60, wm % 60);
+    if (i == wakeIdx)
+    {
+      cv->fillRect(x, y, bw, bh, c565(accent));
+      textC(x + bw / 2 + 1, y + 5, 2, C_BG, buf);
+    }
+    else
+    {
+      cv->drawRect(x, y, bw, bh, c565(C_LINE));
+      textC(x + bw / 2 + 1, y + 5, 2, C_DIM, buf);
+    }
+  }
+}
+
 // ComfyUI の状態を 1 行に (枠の左の欄、15 文字まで)
 void comfyLine(const PcInfo &pc, char *buf, size_t n)
 {
@@ -990,12 +1137,19 @@ void renderFrame()
     return;
   }
   cv->fillScreen(c565(C_BG));
-  if (page == PG_ALARM)
-    drawAlarm();
+  if (page == PG_TIMER_SET)
+    drawTimerSet();
+  else if (page == PG_ALARM_SET)
+    drawAlarmSet();
   else
-    drawTimer();
-  for (int i = 0; i < PC_N; i++)
-    drawPcRow(i);
+  {
+    if (page == PG_ALARM)
+      drawAlarm();
+    else
+      drawTimer();
+    for (int i = 0; i < PC_N; i++)
+      drawPcRow(i);
+  }
   if (millis() < toastUntil && !alert.active && !wakeRinging)
     drawToast();
   if (wakeRinging) // 目覚ましはほかのアラートより上に出す
@@ -1028,7 +1182,8 @@ void timerUpdate()
     state = DONE;
     alarmPending = true;
     recordDone();
-    page = PG_TIMER;
+    if (page != PG_TIMER_SET) // タイマーの設定の画面ならそのまま
+      page = PG_TIMER;
     Serial.printf("timer: done (%u min, today %u)\n", PRESETS[presetIdx], todayCount());
   }
   if (state != DONE)
@@ -1063,16 +1218,31 @@ void timerUpdate()
 }
 
 // ---- 目覚ましを鳴らす ----
-// 鳴り始めに「おはよう ございます」、そのあと 2 秒ごとに音、30 秒ごとに声。どれかのスイッチで止める
+// 鳴り始めに音と「ろくじ さんじゅっぷんに なりました。 きしょう じかんです。」、そのあと 2 秒ごとに音、30 秒ごとに声。どれかのスイッチで止める
+const uint32_t WAKE_SAY_MS = 7000; // しゃべり終わるまで (この間は音を鳴らさない)
+
+// 起きる時刻をしゃべる (時刻は 6:00〜11:30 の 30 分おき)
+void sayWakeTime()
+{
+  static const char *HOURS[] = {"れいじ", "いちじ", "にじ", "さんじ", "よじ", "ごじ", "ろくじ", "しちじ",
+                                "はちじ", "くじ", "じゅうじ", "じゅういちじ", "じゅうにじ"};
+  int m = wakeMin(wakeIdx);
+  char buf[128];
+  snprintf(buf, sizeof(buf), "%s%sに なりました。 きしょう じかんです。", HOURS[m / 60 % 13],
+           m % 60 == 30 ? " さんじゅっぷん" : "");
+  soundSay(buf);
+}
+
 void startWake()
 {
   wakeRinging = true;
   wakeAt = wakeBeepAt = wakeSayAt = millis();
-  page = PG_ALARM;
+  if (page != PG_ALARM_SET) // 目覚ましの設定の画面ならそのまま
+    page = PG_ALARM;
   soundStop();                 // ほかの音は止めて
   soundFixVolume(WAKE_VOLUME); // 寝るときに音を消していても鳴るように、音量の設定とは別に決めた大きさで
   soundPlay(SND_WAKE);
-  soundSay("おはよう ございます。 じかんです。");
+  sayWakeTime();
   Serial.printf("wake: ringing %d:%02d\n", wakeMin(wakeIdx) / 60, wakeMin(wakeIdx) % 60);
 }
 
@@ -1107,9 +1277,9 @@ void wakeUpdate()
   if (now - wakeSayAt >= 30000)
   {
     wakeSayAt = now;
-    soundSay("おはよう ございます。 じかんです。");
+    sayWakeTime();
   }
-  else if (now - wakeSayAt >= 4000 && now - wakeBeepAt >= 2000) // しゃべっている間は鳴らさない
+  else if (now - wakeSayAt >= WAKE_SAY_MS && now - wakeBeepAt >= 2000) // しゃべっている間は鳴らさない
   {
     wakeBeepAt = now;
     soundPlay(SND_WAKE);
@@ -1148,7 +1318,7 @@ void handleButtons()
     return;
   }
 
-  // SW1 長押し: 画面の切り替え (タイマー ⇔ 目覚まし)
+  // SW1 長押し: 画面の切り替え (タイマー → 目覚まし → タイマーの設定 → 目覚ましの設定)
   if (e1 == EV_LONG)
   {
     page = (page + 1) % PG_N;
@@ -1156,7 +1326,7 @@ void handleButtons()
     soundPlay(SND_CLICK);
   }
 
-  if (page == PG_TIMER)
+  if (page == PG_TIMER || page == PG_TIMER_SET)
   {
     // SW1: 時間を選ぶ (動いている間は変えない)
     if (e1 == EV_SHORT && state != RUNNING)
