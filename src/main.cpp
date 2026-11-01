@@ -11,6 +11,7 @@
 #include "WiFiSetup.h"
 #include "config.h" // ピン・液晶・音
 #include "sound.h"
+#include "fonts/Orbitron_Light_32.h" // 起動画面のロゴ (LovyanGFX から写したもの。Adafruit GFX 形式)
 
 // ---- WiFi (起動時に WiFiManager の設定ポータルで設定する。WiFiSetup.h は WorkingTimer・InfoPanel と同じファイル) ----
 #define DEVICE_BASE_NAME "Livico" // 後ろに MAC の末尾 4 桁を付けて AP 名・ホスト名・MQTT クライアント ID に使う (例 Livico-3FA2)
@@ -1113,6 +1114,126 @@ void drawToast()
   text(12, 6, 1, C_TEXT, toastMsg);
 }
 
+// 起動画面 (約 3 秒)。走査線が走り、枠が真ん中から広がり、LIVICO が 1 字ずつ光って点き、
+// 下の棒が PC の 3 色で満ちる。最後の 0.4 秒で暗くして消す
+void splash()
+{
+  const int DUR = 3000;
+  // 字は Orbitron (LuminaCanvas の起動画面と同じ)。字の間を TRACK だけ広げる
+  const GFXfont *TF = &Orbitron_Light_32;
+  const char *TITLE = "LIVICO";
+  const int TN = strlen(TITLE), TRACK = 8;
+  int tx[8], tw = 0; // 1 字ずつの x と、全体の幅
+  for (int i = 0; i < TN; i++)
+  {
+    tx[i] = tw;
+    tw += TF->glyph[TITLE[i] - TF->first].xAdvance + (i < TN - 1 ? TRACK : 0);
+  }
+  const int TX = (SCREEN_W - tw) / 2, TY = 124; // TY は字の下端 (ベースライン)。大文字の高さは 24px
+  uint32_t t0 = millis();
+  soundPlay(SND_BOOT);
+  for (int el = 0; el < DUR; el = millis() - t0)
+  {
+    float fade = el > DUR - 400 ? (DUR - el) / 400.0f : 1.0f;
+    auto fc = [&](uint32_t rgb) { return c565(mix(C_BG, rgb, fade)); };
+    auto ease = [](float k) { k = constrain(k, 0.0f, 1.0f); return 1 - (1 - k) * (1 - k) * (1 - k); };
+    cv->fillScreen(c565(C_BG));
+
+    // 背景の格子 (薄く)
+    for (int x = 0; x < SCREEN_W; x += 20)
+      cv->drawFastVLine(x, 0, SCREEN_H, fc(mix(C_BG, C_LINE, 0.45f)));
+    for (int y = 0; y < SCREEN_H; y += 20)
+      cv->drawFastHLine(0, y, SCREEN_W, fc(mix(C_BG, C_LINE, 0.45f)));
+
+    // 走査線 (はじめの 0.7 秒で上から下へ)
+    if (el < 700)
+    {
+      int y = SCREEN_H * el / 700;
+      for (int k = 1; k <= 6; k++)
+        if (y - k * 2 >= 0)
+          cv->drawFastHLine(0, y - k * 2, SCREEN_W, c565(mix(C_BG, C_CYAN, 0.5f - k * 0.07f)));
+      cv->drawFastHLine(0, y, SCREEN_W, c565(C_CYAN));
+    }
+
+    // 枠 (0.2〜0.8 秒で真ん中から広がる)。角にかぎ
+    float k = ease((el - 200) / 600.0f);
+    if (el >= 200)
+    {
+      int fw = 40 + (int)(232 * k), fh = 16 + (int)(104 * k);
+      int fx = (SCREEN_W - fw) / 2, fy = 120 - fh / 2;
+      cv->fillRect(fx, fy, fw, fh, fc(C_PANEL));
+      cv->drawRect(fx, fy, fw, fh, fc(C_LINE));
+      uint16_t a = fc(C_CYAN);
+      const int L = 10;
+      for (int d = 0; d < 2; d++) // 2px の太さ
+      {
+        cv->drawFastHLine(fx, fy + d, L, a);
+        cv->drawFastVLine(fx + d, fy, L, a);
+        cv->drawFastHLine(fx + fw - L, fy + d, L, a);
+        cv->drawFastVLine(fx + fw - 1 - d, fy, L, a);
+        cv->drawFastHLine(fx, fy + fh - 1 - d, L, a);
+        cv->drawFastVLine(fx + d, fy + fh - L, L, a);
+        cv->drawFastHLine(fx + fw - L, fy + fh - 1 - d, L, a);
+        cv->drawFastVLine(fx + fw - 1 - d, fy + fh - L, L, a);
+      }
+    }
+
+    // 文字 (0.7 秒から 0.12 秒おきに 1 字ずつ)。点いた直後は白く光り、0.3 秒でシアンに
+    cv->setFont(TF);
+    cv->setTextSize(1);
+    for (int i = 0; i < TN; i++)
+    {
+      int at = 700 + i * 120;
+      if (el < at)
+        break;
+      char ch[2] = {TITLE[i], 0};
+      float g = constrain((el - at) / 300.0f, 0.0f, 1.0f);
+      int x = TX + tx[i];
+      if (g < 1) // 光っている間は上下左右に薄くにじませる
+      {
+        cv->setTextColor(c565(mix(C_BG, C_CYAN, 0.45f * (1 - g) * fade)));
+        for (int d = 0; d < 4; d++)
+        {
+          cv->setCursor(x + (d == 0) - (d == 1), TY + (d == 2) - (d == 3));
+          cv->print(ch);
+        }
+      }
+      cv->setTextColor(c565(mix(C_BG, mix(0xFFFFFF, C_CYAN, g), fade)));
+      cv->setCursor(x, TY);
+      cv->print(ch);
+    }
+    cv->setFont(); // ほかの字は標準の 6x8 に戻す
+
+    // 下の棒 (1.4〜2.3 秒で左から満ちる)。色は PC1〜PC3 の色を左から順に
+    float b = ease((el - 1400) / 900.0f);
+    const int BX = TX, BW = tw, BN = BW / 5;
+    int lit = el >= 1400 ? (int)(BN * b + 0.5f) : 0;
+    for (int i = 0; i < BN; i++)
+    {
+      float f = (float)i / (BN - 1) * (PC_N - 1);
+      int j = min((int)f, PC_N - 2);
+      uint32_t rgb = mix(pcs[j].rgb, pcs[j + 1].rgb, f - j);
+      cv->fillRect(BX + i * 5, 136, 4, 4, fc(i < lit ? rgb : C_SEGOFF));
+    }
+
+    // 副題 (2.0 秒から)
+    if (el >= 2000)
+    {
+      uint32_t c = mix(C_BG, C_DIM, constrain((el - 2000) / 300.0f, 0.0f, 1.0f) * fade);
+      textC(SCREEN_W / 2, 150, 1, c, "TIMER / ALARM / SYSTEMS");
+    }
+
+    // 一番下: 進み具合
+    char buf[24];
+    snprintf(buf, sizeof(buf), "BOOT %3d%%", el * 100 / DUR);
+    text(8, SCREEN_H - 14, 1, mix(C_BG, C_DIM, fade), buf);
+    textR(SCREEN_W - 8, SCREEN_H - 14, 1, mix(C_BG, C_DIM, fade), "ESP32-S3");
+
+    cv->flush();
+    soundUpdate();
+  }
+}
+
 // WiFi の設定モード (設定ポータルの間は loop() が止まっているので、一度描くだけ)
 void drawSetup()
 {
@@ -1421,6 +1542,8 @@ void setup()
   for (Button *b : SWS)
     pinMode(b->pin, INPUT_PULLUP);
 
+  splash();
+
   for (PcInfo &pc : pcs)
     pcReset(pc);
 
@@ -1458,7 +1581,6 @@ void setup()
   if (digitalRead(SW1_PIN) == LOW)
     sw1.down = sw1.raw = sw1.longFired = true;
 
-  soundPlay(SND_BOOT);
   Serial.printf("heap: free %u, psram free %u\n", ESP.getFreeHeap(), ESP.getFreePsram());
 }
 
