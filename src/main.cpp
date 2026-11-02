@@ -663,7 +663,7 @@ void segV(int xc, int y0, int y1, int t, uint16_t c)
   }
 }
 
-// 7 セグメントの数字 (細い線で先を尖らせる)。消えている区画も薄く描く。d < 0 は全部消す
+// 7 セグメントの数字 (先を尖らせる)。消えている区画も薄く描く。d < 0 は全部消す
 void seg7(int x, int y, int w, int h, int t, int d, uint32_t on)
 {
   static const uint8_t SEG[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
@@ -742,7 +742,7 @@ void drawBigClock(bool synced, const struct tm &t)
   else
     strcpy(buf, "--:--");
   bool colon = !synced || blinkOn();
-  int w = segText(8, 22, 34, 56, 5, 6, buf, C_TEXT, colon ? C_CYAN : C_SEGOFF);
+  int w = segText(8, 22, 34, 56, 7, 6, buf, C_TEXT, colon ? C_CYAN : C_SEGOFF);
   if (synced)
   {
     snprintf(buf, sizeof(buf), "%02d", t.tm_sec);
@@ -880,7 +880,7 @@ void drawHugeClock(bool synced, const struct tm &t)
   else
     strcpy(buf, "--:--");
   bool colon = !synced || blinkOn();
-  const int W = 50, H = 90, T = 8, GAP = 8;
+  const int W = 50, H = 90, T = 11, GAP = 8;
   int x = (SCREEN_W - segTextW(W, T, GAP, buf) - (synced ? 8 + 36 : 0)) / 2;
   int w = segText(x, 24, W, H, T, GAP, buf, C_TEXT, colon ? C_CYAN : C_SEGOFF);
   if (synced)
@@ -1489,19 +1489,27 @@ void handleButtons()
   }
   else
   {
-    // SW1: 起きる時刻を選ぶ (選んだら ON にする)。SW2: ON / OFF
-    if (e1 == EV_SHORT)
+    // SW1: 起きる時刻を選ぶ。SW2: ON、SW2 長押し: OFF。
+    // 誤って押しても変わらないように、ON の間は SW2 長押しで OFF にするまで時刻も ON / OFF も変えない
+    if (wakeOn && (e1 == EV_SHORT || e2 == EV_SHORT))
+      toast(C_YELLOW, "ALARM LOCKED - HOLD SW2 TO TURN OFF");
+    else if (e1 == EV_SHORT)
     {
       wakeIdx = (wakeIdx + 1) % WAKE_N;
-      wakeOn = true;
       savePrefs();
       soundPlay(SND_CLICK);
     }
-    if (e2 == EV_SHORT)
+    else if (e2 == EV_SHORT)
     {
-      wakeOn = !wakeOn;
+      wakeOn = true;
       savePrefs();
-      soundPlay(wakeOn ? SND_START : SND_PAUSE);
+      soundPlay(SND_START);
+    }
+    if (e2 == EV_LONG && wakeOn)
+    {
+      wakeOn = false;
+      savePrefs();
+      soundPlay(SND_PAUSE);
     }
   }
 
